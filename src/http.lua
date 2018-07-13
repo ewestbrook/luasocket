@@ -17,7 +17,6 @@ local base = _G
 local table = require("table")
 socket.http = {}
 local _M = socket.http
-
 -----------------------------------------------------------------------------
 -- Program constants
 -----------------------------------------------------------------------------
@@ -45,7 +44,7 @@ local SCHEMES = {
 local SCHEME = 'http'
 local PORT = SCHEMES[SCHEME].port
 -----------------------------------------------------------------------------
--- Reads MIME headers from a connection, unfolding where needed
+-- Reads MIME response headers from a connection, unfolding where needed
 -----------------------------------------------------------------------------
 local function receiveheaders(sock, headers)
     local line, name, value, err
@@ -159,7 +158,7 @@ function metat.__index:sendbody(headers, source, step)
     return self.try(ltn12.pump.all(source, socket.sink(mode, self.c), step))
 end
 
-function metat.__index:receivestatusline()
+function metat.__index:receivestatusline(respheaders)
     local status,ec = self.try(self.c:receive(5))
     -- identify HTTP/0.9 responses, which do not contain a status line
     -- this is just a heuristic, but is what the RFC recommends
@@ -171,12 +170,14 @@ function metat.__index:receivestatusline()
     end
     -- otherwise proceed reading a status line
     status = self.try(self.c:receive("*l", status))
+    respheaders.status = status
     local code = socket.skip(2, string.find(status, "HTTP/%d*%.%d* (%d%d%d)"))
+    respheaders.code = base.tonumber(code)
     return self.try(base.tonumber(code), status)
 end
 
-function metat.__index:receiveheaders()
-    return self.try(receiveheaders(self.c))
+function metat.__index:receiveheaders(respheaders)
+    return self.try(receiveheaders(self.c, respheaders))
 end
 
 function metat.__index:receivebody(headers, sink, step)
@@ -315,17 +316,30 @@ local function shouldreceivebody(reqt, code)
     return 1
 end
 
+-- save prior response header to a new indexed subtable
+local function nest(t)
+    local k,v = next(t, nil)
+    if k then
+        local o = {}
+        while k do
+            o[k],t[k] = v,nil
+            k,v = next(t, k) end
+        t[1] = o end end
+
 -- forward declarations
 local trequest, tredirect
 
---[[local]] function tredirect(reqt, location)
+--[[local]] function tredirect(reqt, respheaders)
     -- the RFC says the redirect URL has to be absolute, but some
-    -- servers do not respect that
+  -- servers do not respect that
+    local location = respheaders.location
     local newurl = url.absolute(reqt.url, location)
     -- if switching schemes, reset port and create function
     if url.parse(newurl).scheme ~= reqt.scheme then
         reqt.port = nil
         reqt.create = nil end
+    -- collect response headers received so far
+    nest(respheaders)
     -- make new request
     local result, code, headers, status = trequest {
         url = newurl,
@@ -335,12 +349,13 @@ local trequest, tredirect
         proxy = reqt.proxy,
         maxredirects = reqt.maxredirects,
         nredirects = (reqt.nredirects or 0) + 1,
-        create = reqt.create
+        create = reqt.create,
+        respheaders = respheaders
     }
-    -- pass location header back as a hint we redirected
-    headers = headers or {}
-    headers.location = headers.location or location
-    return result, code, headers, status
+    -- pass location back as a hint we redirected
+    if not respheaders.location then
+        respheaders.location = reqt.url end
+    return result, code, respheaders, status
 end
 
 --[[local]] function trequest(reqt)
@@ -355,7 +370,9 @@ end
     if nreqt.source then
         h:sendbody(nreqt.headers, nreqt.source, nreqt.step)
     end
-    local code, status = h:receivestatusline()
+    local respheaders = reqt.respheaders or {}
+    respheaders.method = nreqt.method
+    local code, status = h:receivestatusline(respheaders)
     -- if it is an HTTP/0.9 server, simply get the body and we are done
     if not code then
         h:receive09body(status, nreqt.sink, nreqt.step)
@@ -363,25 +380,24 @@ end
     elseif code == 408 then
         return 1, code
     end
-    local headers
     -- ignore any 100-continue messages
     while code == 100 do
-        headers = h:receiveheaders()
-        code, status = h:receivestatusline()
+        h:receiveheaders(respheaders)
+        code, status = h:receivestatusline(respheaders)
     end
-    headers = h:receiveheaders()
+    respheaders = h:receiveheaders(respheaders)
     -- at this point we should have a honest reply from the server
     -- we can't redirect if we already used the source, so we report the error
-    if shouldredirect(nreqt, code, headers) and not nreqt.source then
+    if shouldredirect(nreqt, code, respheaders) and not nreqt.source then
         h:close()
-        return tredirect(reqt, headers.location)
+        return tredirect(reqt, respheaders)
     end
     -- here we are finally done
     if shouldreceivebody(nreqt, code) then
-        h:receivebody(headers, nreqt.sink, nreqt.step)
+        h:receivebody(respheaders, nreqt.sink, nreqt.step)
     end
     h:close()
-    return 1, code, headers, status
+    return 1, code, respheaders, status
 end
 
 -- turns an url and a body into a generic request
@@ -407,8 +423,8 @@ _M.genericform = genericform
 
 local function srequest(u, b)
     local reqt = genericform(u, b)
-    local _, code, headers, status = trequest(reqt)
-    return table.concat(reqt.target), code, headers, status
+    local _, code, respheaders, status = trequest(reqt)
+    return table.concat(reqt.target), code, respheaders, status
 end
 
 _M.request = socket.protect(function(reqt, body)
